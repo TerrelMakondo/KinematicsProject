@@ -1,0 +1,357 @@
+ import math
+  import random
+
+  import pygame
+  import pymunk
+
+
+  class Slider:
+     
+
+      HANDLE_RADIUS = 7
+      TRACK_HEIGHT = 4
+      LABEL_GAP = 6
+
+      def __init__(self, x, y, width, label, lo, hi, initial, fmt="{:.2f}"):
+          self.rect = pygame.Rect(x, y, width, self.TRACK_HEIGHT)
+          self.label = label
+          self.lo = lo
+          self.hi = hi
+          self.value = initial
+          self.fmt = fmt
+          self.dragging = False
+          self.font = pygame.font.SysFont("consolas", 14)
+          self._label_h = self.font.get_height()
+
+      def _value_to_x(self, v):
+          return self.rect.x + (v - self.lo) / (self.hi - self.lo) * self.rect.width
+
+      def _x_to_value(self, x):
+          t = (x - self.rect.x) / self.rect.width
+          t = max(0.0, min(1.0, t))
+          return self.lo + t * (self.hi - self.lo)
+
+      def handle_event(self, event):
+          if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+              hx = self._value_to_x(self.value)
+              hy = self.rect.y + self.rect.height // 2
+              if math.hypot(event.pos[0] - hx, event.pos[1] - hy) <= self.HANDLE_RADIUS + 4:
+                  self.dragging = True
+              elif self.rect.collidepoint(event.pos):
+                  # Click on the track jumps the handle there.
+                  self.value = self._x_to_value(event.pos[0])
+          elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+              self.dragging = False
+          elif event.type == pygame.MOUSEMOTION and self.dragging:
+              self.value = self._x_to_value(event.pos[0])
+
+      def height(self):
+          return self._label_h + self.LABEL_GAP + self.TRACK_HEIGHT + self.HANDLE_RADIUS * 2
+
+      def draw(self, surface):
+          label_surf = self.font.render(
+              f"{self.label}: {self.fmt.format(self.value)}", True, HUD_COLOR
+          )
+          surface.blit(label_surf, (self.rect.x, self.rect.y - self._label_h - self.LABEL_GAP))
+
+          track_y = self.rect.y + self.rect.height // 2
+          pygame.draw.line(
+              surface, WALL_COLOR,
+              (self.rect.x, track_y), (self.rect.x + self.rect.width, track_y),
+              self.TRACK_HEIGHT,
+          )
+          hx = self._value_to_x(self.value)
+          hy = self.rect.y + self.rect.height // 2
+          pygame.draw.circle(surface, CIRCLE_COLOR, (int(hx), int(hy)), self.HANDLE_RADIUS)
+          pygame.draw.circle(surface, BG_COLOR, (int(hx), int(hy)), self.HANDLE_RADIUS - 3)
+
+  # ---------------------------------------------------------------------------
+  # Configuration
+  # ---------------------------------------------------------------------------
+
+  WIDTH, HEIGHT = 900, 700
+  FPS = 60
+
+  BG_COLOR = (20, 25, 40)
+  WALL_COLOR = (200, 200, 220)
+  PARTICLE_COLOR = (245, 245, 255)
+  CIRCLE_COLOR = (255, 255, 255)
+  HUD_COLOR = (180, 180, 200)
+
+  WALL_THICKNESS = 2
+  CIRCLE_RADIUS = 120
+  CIRCLE_CENTER = (WIDTH // 2, HEIGHT // 2)
+
+  TARGET_PARTICLE_COUNT = 150
+  PARTICLE_RADIUS = 5
+  PARTICLE_MASS = 1.0
+  ELASTICITY = 1.0            # fully elastic, water-like
+  FRICTION = 0.0
+  CIRCLE_FRICTION = 0.0       # extra-slippery on the hollow circle
+
+  # Live state — sliders mutate these.
+  elasticity = ELASTICITY
+  friction = FRICTION
+  circle_friction = CIRCLE_FRICTION
+  target_particle_count = TARGET_PARTICLE_COUNT
+
+  # Right edge is open: when a particle's x exceeds this, it is despawned.
+  RIGHT_EXIT = WIDTH + PARTICLE_RADIUS * 2
+
+  # ---------------------------------------------------------------------------
+  # Setup
+  # ---------------------------------------------------------------------------
+
+  pygame.init()
+  pygame.display.set_caption("Particle Simulator — Hollow Circle")
+  screen = pygame.display.set_mode((WIDTH, HEIGHT))
+  clock = pygame.time.Clock()
+  font = pygame.font.SysFont("consolas", 16)
+
+  space = pymunk.Space()
+  space.gravity = (0, 0)      # top-down, no gravity
+  space.damping = 0.0         # no energy loss — keep the flow perpetual
+
+
+  def _wall_segment(p1, p2):
+      """Static line segment used as a wall."""
+      body = pymunk.Body(body_type=pymunk.Body.STATIC)
+      shape = pymunk.Segment(body, p1, p2, WALL_THICKNESS)
+      shape.elasticity = elasticity
+      shape.friction = friction
+      return body, shape
+
+  # Top, bottom, and left walls. No right wall — particles flow out.
+  wall_shapes = []
+  for p1, p2 in [
+      ((0, 0), (WIDTH, 0)),
+      ((0, HEIGHT), (WIDTH, HEIGHT)),
+      ((0, 0), (0, HEIGHT)),
+  ]:
+      body, shape = _wall_segment(p1, p2)
+      space.add(body, shape)
+      wall_shapes.append(shape)
+
+  # Solid disc in the middle on a kinematic body — particles bounce off the
+  # whole face (nothing can enter the interior), and the user can drag it.
+  # Drawn as a ring outline so the look stays "hollow".
+  circle_body = pymunk.Body(body_type=pymunk.Body.KINEMATIC)
+  circle_body.position = CIRCLE_CENTER
+  circle_shape = pymunk.Circle(circle_body, CIRCLE_RADIUS)
+  circle_shape.elasticity = elasticity
+  circle_shape.friction = circle_friction
+  space.add(circle_body, circle_shape)
+
+  # ---------------------------------------------------------------------------
+  # Particle helpers
+  # ---------------------------------------------------------------------------
+
+  particles = []  # list of (pymunk.Body, pymunk.Circle)
+
+
+  def _point_inside_disc(x, y, margin=PARTICLE_RADIUS + 2):
+      """True if (x, y) is safely outside the live disc (so spawning won't overlap)."""
+      dx = x - circle_body.position.x
+      dy = y - circle_body.position.y
+      return math.hypot(dx, dy) > CIRCLE_RADIUS + margin
+
+
+  def spawn_particle(at_left_edge=False):
+      """Create a new particle at a random safe position with a small rightward push."""
+      if at_left_edge:
+          x = random.uniform(PARTICLE_RADIUS + 2, WIDTH * 0.15)
+          y = random.uniform(PARTICLE_RADIUS + 2, HEIGHT - PARTICLE_RADIUS - 2)
+          # Refuse spawn if the disc is currently covering the spawn band.
+          if not _point_inside_disc(x, y):
+              return
+      else:
+          # Random position anywhere in the box, but not inside the disc.
+          for _ in range(50):
+              x = random.uniform(PARTICLE_RADIUS + 2, WIDTH - PARTICLE_RADIUS - 2)
+              y = random.uniform(PARTICLE_RADIUS + 2, HEIGHT - PARTICLE_RADIUS - 2)
+              if _point_inside_disc(x, y):
+                  break
+          else:
+              return  # couldn't find a safe spot this attempt
+
+      body = pymunk.Body(PARTICLE_MASS, pymunk.moment_for_circle(
+          PARTICLE_MASS, 0, PARTICLE_RADIUS))
+      body.position = (x, y)
+      # Strong rightward bias so particles flow across the box.
+      body.velocity = (
+          random.uniform(200, 300),
+          random.uniform(-80, 80),
+      )
+
+      shape = pymunk.Circle(body, PARTICLE_RADIUS)
+      shape.elasticity = elasticity
+      shape.friction = friction
+      space.add(body, shape)
+      particles.append((body, shape))
+
+
+  def despawn_particle(idx):
+      body, shape = particles.pop(idx)
+      space.remove(body, shape)
+
+
+  # Seed the simulation.
+  for _ in range(TARGET_PARTICLE_COUNT):
+      spawn_particle()
+
+  # ---------------------------------------------------------------------------
+  # Sliders (UI)
+  # ---------------------------------------------------------------------------
+
+  friction_slider = Slider(
+      x=20, y=HEIGHT - 30, width=220,
+      label="Friction", lo=0.0, hi=1.0, initial=friction,
+  )
+  circle_friction_slider = Slider(
+      x=20, y=HEIGHT - 30 - friction_slider.height() - 8, width=220,
+      label="Circle friction", lo=0.0, hi=1.0, initial=circle_friction,
+  )
+  particle_count_slider = Slider(
+      x=20, y=HEIGHT - 30 - 2 * (friction_slider.height() + 8), width=220,
+      label="Particles", lo=0.0, hi=500.0, initial=target_particle_count,
+      fmt="{:.0f}",
+  )
+  sliders = [friction_slider, circle_friction_slider, particle_count_slider]
+
+  # ---------------------------------------------------------------------------
+  # Main loop
+  # ---------------------------------------------------------------------------
+
+  running = True
+  dragging_circle = False
+  drag_last_pos = (0, 0)
+  drag_last_time = 0
+
+  def _clamp_circle_position():
+      """Keep the circle inside the box (with its radius margin from each wall)."""
+      x = max(CIRCLE_RADIUS + 2, min(WIDTH - CIRCLE_RADIUS - 2, circle_body.position.x))
+      y = max(CIRCLE_RADIUS + 2, min(HEIGHT - CIRCLE_RADIUS - 2, circle_body.position.y))
+      circle_body.position = (x, y)
+
+  while running:
+      mouse_pos = pygame.mouse.get_pos()
+      mouse_pressed = pygame.mouse.get_pressed()
+
+      for event in pygame.event.get():
+          if event.type == pygame.QUIT:
+              running = False
+          elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+              # Any click inside the disc grabs the whole circle. This makes
+              # the entire face — ring and interior — grabbable.
+              dx = event.pos[0] - circle_body.position.x
+              dy = event.pos[1] - circle_body.position.y
+              if math.hypot(dx, dy) <= CIRCLE_RADIUS:
+                  dragging_circle = True
+                  drag_last_pos = event.pos
+                  drag_last_time = pygame.time.get_ticks()
+          elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+              dragging_circle = False
+          for slider in sliders:
+              slider.handle_event(event)
+
+      # Propagate slider values to live state and to all physics shapes.
+      friction = friction_slider.value
+      circle_friction = circle_friction_slider.value
+      for shape in wall_shapes:
+          shape.friction = friction
+      circle_shape.friction = circle_friction
+      for body, shape in particles:
+          shape.friction = friction
+
+      # Drag the circle kinematically: compute velocity from cursor motion so
+      # particles bounce off it realistically, and carry throw momentum on release.
+      if dragging_circle and mouse_pressed[0]:
+          now = pygame.time.get_ticks()
+          dt_ms = max(1, now - drag_last_time)
+          vx = (mouse_pos[0] - drag_last_pos[0]) * 1000.0 / dt_ms
+          vy = (mouse_pos[1] - drag_last_pos[1]) * 1000.0 / dt_ms
+          circle_body.velocity = (vx, vy)
+          circle_body.position = mouse_pos
+          _clamp_circle_position()
+          drag_last_pos = mouse_pos
+          drag_last_time = now
+      else:
+          # Free motion (or settling after release); use its own velocity.
+          _clamp_circle_position()
+          circle_body.velocity = (circle_body.velocity.x * 0.92,
+                                  circle_body.velocity.y * 0.92)
+
+      # Step physics.
+      space.step(1.0 / FPS)
+
+      # Pull the live particle count target from the slider.
+      target_particle_count = int(round(particle_count_slider.value))
+
+      # Despawn particles that have flowed out the right side, plus any
+      # excess because the user lowered the count slider.
+      target = target_particle_count
+      i = 0
+      while i < len(particles):
+          body, _ = particles[i]
+          exited = body.position.x > RIGHT_EXIT
+          over_target = len(particles) > target
+          if exited or over_target:
+              despawn_particle(i)
+          else:
+              i += 1
+
+      # Top up the population from the left edge. Cap attempts so we don't
+      # spin forever if the disc currently blocks the spawn band.
+      top_up_attempts = 0
+      while len(particles) < target_particle_count and top_up_attempts < 50:
+          before = len(particles)
+          spawn_particle(at_left_edge=True)
+          if len(particles) == before:
+              top_up_attempts += 1
+
+      # Re-energize any particle that has slowed below the flow speed, so the
+      # left-to-right stream stays perpetual even after many collisions.
+      MIN_SPEED = 150.0
+      for body, _ in particles:
+          speed = math.hypot(body.velocity.x, body.velocity.y)
+          if speed < MIN_SPEED:
+              # Keep current direction, scale up to MIN_SPEED.
+              if speed > 0.1:
+                  scale = MIN_SPEED / speed
+                  body.velocity = (body.velocity.x * scale, body.velocity.y * scale)
+              else:
+                  body.velocity = (MIN_SPEED, 0.0)
+
+      # Draw.
+      screen.fill(BG_COLOR)
+
+      # Walls
+      pygame.draw.line(screen, WALL_COLOR, (0, 0), (WIDTH, 0), WALL_THICKNESS)
+      pygame.draw.line(screen, WALL_COLOR, (0, HEIGHT), (WIDTH, HEIGHT), WALL_THICKNESS)
+      pygame.draw.line(screen, WALL_COLOR, (0, 0), (0, HEIGHT), WALL_THICKNESS)
+
+      # Disc boundary (drawn at its live, draggable position). Solid
+      # collision disc; we draw a ring outline to keep the "hollow" look.
+      cx, cy = circle_body.position.x, circle_body.position.y
+      pygame.draw.circle(screen, CIRCLE_COLOR, (int(cx), int(cy)), CIRCLE_RADIUS, 3)
+
+      # Particles
+      for body, shape in particles:
+          pos = body.position
+          pygame.draw.circle(screen, PARTICLE_COLOR,
+                             (int(pos.x), int(pos.y)),
+                             PARTICLE_RADIUS)
+
+      # HUD
+      fps = clock.get_fps()
+      hud = f"FPS: {fps:5.1f}   Particles: {len(particles)}   Elasticity: {ELASTICITY}"
+      screen.blit(font.render(hud, True, HUD_COLOR), (10, 10))
+
+      # Sliders
+      for slider in sliders:
+          slider.draw(screen)
+
+      pygame.display.flip()
+      clock.tick(FPS)
+
+  pygame.quit()
